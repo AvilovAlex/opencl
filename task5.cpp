@@ -2,12 +2,15 @@
 #define CL_HPP_MINIMUM_OPENCL_VERSION 120
 #include <CL/cl2.hpp>
 
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <iostream>
 #include <time.h>
 #include <string.h>
 
 using namespace cl;
 using namespace std;
+using namespace cv;
 
 #define checkError(func) \
   if (errcode != CL_SUCCESS)\
@@ -20,68 +23,107 @@ using namespace std;
   command; \
   checkError(command);
 
+struct uchar3{
+  uchar x,y,z;
+  uchar3(uchar xx, uchar yy, uchar zz)
+  {
+    x = xx;
+    y = yy;
+    z = zz;
+  }
+};
+
 int main()
 {
   int device_index = 0;
   cl_int errcode;
 
-  const int rowCount = 25600;
-  const int colCount = 1024;
-  int * matrix = (int*) malloc(rowCount*colCount*sizeof(int));
-  if (matrix==NULL) exit (1);
 
-  //srand(0);
 
-  //заполнение матрицы случайными числами
- for(int i = 0; i < rowCount; i++)
-    for(int j = 0; j < colCount; j++)
-      matrix[i*colCount + j] = colCount-j/*rand() % 100 + 1*/;
+      //picture variable
+      cv::Mat image;
 
-  int* countTranspArr = (int*) malloc(rowCount*sizeof(int));
+      image = cv::imread("fish1.png", CV_LOAD_IMAGE_COLOR);   // Read the file
+      int rowCount = image.rows;
+      int colCount = image.cols;
+      if(! image.data )                              // Check for invalid input
+      {
+          cout <<  "Could not open or find the image" << std::endl ;
+          return -1;
+      }
+      int * procresCPU = new int[image.rows];
 
-  clock_t startCPU = clock();
-  //#pragma omp parallel for
-  for(int i = 0; i < rowCount; i++){
-    int localCount = 0;
-    for(int j = 0; j < colCount-1; j++){
-      if(matrix[i*colCount + j] > matrix[i*colCount + j + 1])
-        localCount++;
-    }
-    countTranspArr[i] = localCount;
-  }
+      for (int i = 0; i < image.rows; i++)
+        procresCPU[i] = 0;
 
-  int N = rowCount * colCount;
-  double elapsedTimeCPU = (double)(clock()-startCPU)/CLOCKS_PER_SEC;
+      //===========================processor calculation===========================
 
-  //код kernel-функции
-string sourceString = "\n\
-__kernel void sharedCalc(__global uchar3 *source,__global int *res, int rows, int cols)\n\
-{\n\
-    int regres = 0;\n\
-    int i = get_global_id(0);\n\
-    int bx = get_group_id(0)s;\n\
-    int th =  get_local_id(0);\n\
-    int blockSize = get_local_size(0);\n\
-    if (i >= rows) return;\n\
+      float elapsedTimeCPU;
+      clock_t startCPU;
+      startCPU = clock();
 
-    __local uchar3 cashe_tile[256][64];\n\
+      for(int i = 0; i < image.rows; i++)
+      {
+          //pointer to 1st pixel in row
+          Vec3b* p1 = image.ptr<Vec3b>(i);
+          for (int j = 0; j < image.cols; j++)
+                if (
+                    p1[j][0] +
+                    p1[j][1] +
+                    p1[j][2] < 700)
+                {
+                  procresCPU[i]++;
+                }
+      }
 
-    for(int p = 0; p < cols/64; ++p)\n\
-    {\n\
-      for (int r = 0; r < 64; r++)\n\
+      elapsedTimeCPU = (double)(clock()-startCPU)/CLOCKS_PER_SEC;
+      //int stop = getTickCount();
+      cout << "CPU sum time = " << elapsedTimeCPU*1000 << " ms\n";
+
+      //=========================end processor calculation=========================
+
+      uchar *dev_img;
+      uchar3 *dev3_img;
+      int *res_arr;
+      int * procres = new int[image.rows];
+      for (int i = 0; i < image.rows; i++)
+        procres[i] = 0;
+
+      uchar * matrix = new uchar[image.rows*image.cols*3];
+      for (int i = 0; i < image.rows*image.cols*3; i++)
+      {
+        matrix[i*3] = image.data[i*3];
+        matrix[i*3 + 1] = image.data[i*3 + 1];
+        matrix[i*3 + 2] = image.data[i*3 + 2];
+      }
+        // uchar3 * matrix = image.data;
+
+    string sourceString =
+      "__kernel void sharedCalc(__global uchar *source,__global int *res, int rows, int cols)\n\
       {\n\
-        cashe_tile[th / 64 + r * 4][th % 64] = source[(th / 64 + r * 4 + +bx*blockSize)*cols + (th % 64 + p*64)];\n\
-      }\n\
-      barrier(CLK_LOCAL_MEM_FENCE);\n\
-      for (int j = 0; j < 64; j++)\n\
-      {\n\
-        uchar3 w = cashe_tile[th][j];\n\
-        regres += w.x + w.y + w.z < 700;\n\
-      }\n\
-      barrier(CLK_LOCAL_MEM_FENCE);\n\
-    }\n\
-    res[i] = regres;\n\
-}";
+          int regres = 0;\n\
+          int i = get_global_id(0);\n\
+          int bx = get_group_id(0);\n\
+          int th = get_local_id(0);\n\
+          int blockSize = get_local_size(0);\n\
+          if (i >= rows) return;\n\
+          __local uchar3 cashe_tile[256][TILE_WIDTH];\n\
+          for(int p = 0; p < cols/TILE_WIDTH; ++p)\n\
+          {\n\
+            for (int r = 0; r < 64; r++)\n\
+            {\n\
+              cashe_tile[th / 64 + r * 4][th % 64] = source[(th / 64 + r * 4 + +bx*blockSize)*cols + (th % 64 + p*64)];\n\
+            }\n\
+            barrier(CLK_LOCAL_MEM_FENCE);\n\
+            for (int j = 0; j < TILE_WIDTH; j++)\n\
+            {\n\
+              uchar3 w = cashe_tile[th][j];\n\
+              regres += w.x + w.y + w.z < 700;\n\
+            }\n\
+            barrier(CLK_LOCAL_MEM_FENCE);\n\
+          }\n\
+          res[i] = regres;\n\
+    }";
   //получаем список доступных OpenCL-платформ (драйверов OpenCL)
   std::vector<Platform> platform;//массив в который будут записываться идентификаторы платформ
   checkErrorEx( errcode = Platform::get(&platform) );
@@ -119,18 +161,18 @@ __kernel void sharedCalc(__global uchar3 *source,__global int *res, int rows, in
       return 1;
   }
   //создаем буфферы в видеопамяти
-  checkErrorEx( Buffer matrixCL = Buffer( context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(int)*rowCount*colCount,  matrix, &errcode ) );
-  checkErrorEx( Buffer res = Buffer( context, CL_MEM_READ_WRITE, sizeof(int)*rowCount,  NULL, &errcode ) );
+  checkErrorEx( Buffer matrixCL = Buffer( context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, 3*image.rows*image.cols, matrix, &errcode ) );
+  checkErrorEx( Buffer res = Buffer( context, CL_MEM_READ_WRITE, image.rows*sizeof(int), procres , &errcode ) );
 
   //создаем объект - точку входа GPU-программы
-  auto countTransp2 = KernelFunctor<Buffer, Buffer, int, int>(program, "countTransp2");
+  auto sharedCalc = KernelFunctor<Buffer, Buffer, int, int>(program, "sharedCalc");
 
   //создаем объект, соответствующий определенной конфигурации запуска kernel
   EnqueueArgs enqueueArgs(queue, (rowCount+255)/256*256/*globalSize*/, 256/*blockSize*/);
 
   //запускаем и ждем
   clock_t t0 = clock();
-  Event event = countTransp2(enqueueArgs, matrixCL, res, rowCount, colCount);
+  Event event = sharedCalc(enqueueArgs, matrixCL, res, rowCount, colCount);
   checkErrorEx( errcode = event.wait() );
   clock_t t1 = clock();
 
@@ -150,12 +192,13 @@ __kernel void sharedCalc(__global uchar3 *source,__global int *res, int rows, in
   checkErrorEx( errcode = queue.enqueueReadBuffer(res, true, 0, sizeof(int)*rowCount, host_res, NULL, NULL) );
   // check
   for (int i = 0; i < rowCount; i++)
-      if (::abs(host_res[i] - countTranspArr[i]) > 1e-6)
+      if (::abs(host_res[i] - procresCPU[i]) > 1e-6)
       {
           cout << "Error in element N " << i << ": host_res[i] = "
-            << host_res[i] << " countTranspArr[i] = " << countTranspArr[i] << "\n";
+            << host_res[i] << " procresCPU[i] = " << procresCPU[i] << "\n";
           exit(1);
       }
+  int N = rowCount*colCount*3;
   cout << "CPU sum time = " << elapsedTimeCPU*1000 << " ms\n";
   cout << "CPU memory throughput = " << 2*(rowCount*sizeof(int)+N*sizeof(int))/elapsedTimeCPU/1024/1024/1024 << " Gb/s\n";
   cout << "GPU sum time = " << elapsedTimeGPU*1000 << " ms\n";
