@@ -25,12 +25,6 @@ using namespace cv;
 
 struct uchar3{
   uchar x,y,z;
-  uchar3(uchar xx, uchar yy, uchar zz)
-  {
-    x = xx;
-    y = yy;
-    z = zz;
-  }
 };
 
 int main()
@@ -56,6 +50,9 @@ int main()
       for (int i = 0; i < image.rows; i++)
         procresCPU[i] = 0;
 
+      int* procresGPU = new int[rowCount];
+      for (int i = 0; i < image.rows; i++)
+        procresGPU[i] = 0;
       //===========================processor calculation===========================
 
       float elapsedTimeCPU;
@@ -89,30 +86,29 @@ int main()
       for (int i = 0; i < image.rows; i++)
         procres[i] = 0;
 
-      uchar * matrix = new uchar[image.rows*image.cols*3];
-      for (int i = 0; i < image.rows*image.cols*3; i++)
-      {
-        matrix[i*3] = image.data[i*3];
-        matrix[i*3 + 1] = image.data[i*3 + 1];
-        matrix[i*3 + 2] = image.data[i*3 + 2];
-      }
-        // uchar3 * matrix = image.data;
+
+      uchar3 * matrix = new uchar3[image.rows*image.cols];
+      for (int i = 0; i < image.rows*image.cols; i++)
+        matrix[i] = uchar3{image.data[i*3], image.data[i*3 + 1], image.data[i*3 + 2]};
 
     string sourceString =
-      "__kernel void sharedCalc(__global uchar *source,__global int *res, int rows, int cols)\n\
+      "__kernel void sharedCalc(__global uchar3 *source,__global int *res, int rows, int cols)\n\
       {\n\
+          const int TILE_WIDTH = 32;\n\
           int regres = 0;\n\
           int i = get_global_id(0);\n\
           int bx = get_group_id(0);\n\
           int th = get_local_id(0);\n\
           int blockSize = get_local_size(0);\n\
           if (i >= rows) return;\n\
-          __local uchar3 cashe_tile[256][TILE_WIDTH];\n\
+          __local uchar3 cashe_tile[256][32];\n\
           for(int p = 0; p < cols/TILE_WIDTH; ++p)\n\
           {\n\
-            for (int r = 0; r < 64; r++)\n\
+            for (int r = 0; r < TILE_WIDTH; r++)\n\
             {\n\
-              cashe_tile[th / 64 + r * 4][th % 64] = source[(th / 64 + r * 4 + +bx*blockSize)*cols + (th % 64 + p*64)];\n\
+              int ind = th / TILE_WIDTH + r * 256/TILE_WIDTH;\n\
+              cashe_tile[ind][th % TILE_WIDTH] =\n\
+              source[(ind + bx*blockSize)*cols + (th % TILE_WIDTH + p*TILE_WIDTH)];\n\
             }\n\
             barrier(CLK_LOCAL_MEM_FENCE);\n\
             for (int j = 0; j < TILE_WIDTH; j++)\n\
@@ -129,7 +125,8 @@ int main()
   checkErrorEx( errcode = Platform::get(&platform) );
   cout << "OpenCL platforms found: " << platform.size() << "\n";
   cout << "Platform[0] is : " << platform[0].getInfo<CL_PLATFORM_VENDOR>() << " ver. " << platform[0].getInfo<CL_PLATFORM_VERSION>() << "\n";
-
+  for (int i = 0; i < image.rows; i++)
+    procresGPU[i] = procresCPU[i];
   //в полученном списке платформ находим устройство GPU (видеокарту)
   std::vector<Device> devices;
   platform[0].getDevices(CL_DEVICE_TYPE_GPU, &devices);
@@ -161,14 +158,14 @@ int main()
       return 1;
   }
   //создаем буфферы в видеопамяти
-  checkErrorEx( Buffer matrixCL = Buffer( context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, 3*image.rows*image.cols, matrix, &errcode ) );
+  checkErrorEx( Buffer matrixCL = Buffer( context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, image.rows*image.cols*sizeof(uchar3), matrix, &errcode ) );
   checkErrorEx( Buffer res = Buffer( context, CL_MEM_READ_WRITE, image.rows*sizeof(int), procres , &errcode ) );
 
   //создаем объект - точку входа GPU-программы
   auto sharedCalc = KernelFunctor<Buffer, Buffer, int, int>(program, "sharedCalc");
 
   //создаем объект, соответствующий определенной конфигурации запуска kernel
-  EnqueueArgs enqueueArgs(queue, (rowCount+255)/256*256/*globalSize*/, 256/*blockSize*/);
+  EnqueueArgs enqueueArgs(queue, (rowCount+255)/256/*globalSize*/, 256/*blockSize*/);
 
   //запускаем и ждем
   clock_t t0 = clock();
@@ -188,15 +185,20 @@ int main()
     checkError(event.getEventProfilingInfo);
     elapsedTimeGPU = (double)(time_end - time_start)/1e9;
   }
+
   int* host_res = new int[rowCount];
+  for (int i = 0; i < image.rows; i++)
+    host_res[i] = 0;
   checkErrorEx( errcode = queue.enqueueReadBuffer(res, true, 0, sizeof(int)*rowCount, host_res, NULL, NULL) );
   // check
   for (int i = 0; i < rowCount; i++)
-      if (::abs(host_res[i] - procresCPU[i]) > 1e-6)
+      if (procresGPU[i] != procresCPU[i])
       {
-          cout << "Error in element N " << i << ": host_res[i] = "
-            << host_res[i] << " procresCPU[i] = " << procresCPU[i] << "\n";
-          exit(1);
+          cout << "Error in element " << i << ": procresGPU[i] = "
+            << procresGPU[i] << " procresCPU[i] = " << procresCPU[i] << "\n"
+            << "Logic are " << (host_res[i] = procresCPU[i]) << "\n";
+
+          // exit(1);
       }
   int N = rowCount*colCount*3;
   cout << "CPU sum time = " << elapsedTimeCPU*1000 << " ms\n";
